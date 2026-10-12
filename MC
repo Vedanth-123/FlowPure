@@ -1,0 +1,30 @@
+import tensorflow as tf
+import tensorflow_probability as tfp
+tfd = tfp.distributions
+
+def build_pinn(input_shape):
+    # Prior distribution: What we think weights look like before seeing data
+    def prior(kernel_size, bias_size, dtype=None):
+        n = kernel_size + bias_size
+        return tf.keras.Sequential([
+            tfp.layers.VariableLayer(n, dtype=dtype),
+            tfp.layers.DistributionLambda(lambda t: tfd.Independent(
+                tfd.Normal(loc=t, scale=1), reinterpreted_batch_ndims=1))
+        ])
+
+    # Posterior distribution: What the model learns aftervalidate seeing data
+    def posterior(kernel_size, bias_size, dtype=None):
+        n = kernel_size + bias_size
+        return tf.keras.Sequential([
+            tfp.layers.VariableLayer(tfp.layers.MultivariateNormalTriL.params_size(n), dtype=dtype),
+            tfp.layers.MultivariateNormalTriL(n)
+        ])
+
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(input_shape,)),
+        # Bayesian Hidden Layers
+        tfp.layers.DenseVariational(64, posterior, prior, kl_weight=1/100, activation='tanh'),
+        tfp.layers.DenseVariational(32, posterior, prior, kl_weight=1/100, activation='tanh'),
+        tf.keras.layers.Dense(1) # Output: Predicted DO
+    ])
+    return model
