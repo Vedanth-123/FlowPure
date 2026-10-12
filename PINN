@@ -1,0 +1,86 @@
+import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+import numpy as np
+import pandas as pd
+from models.stp_model import build_pinn
+from physics.stp_physics import stp_physics_loss
+
+# --- STEP 1: LOAD DATA WITH DYNAMIC ROW COUNTING ---
+try:
+    # Load the real dataset
+    df = pd.read_csv('data/grey_water_management.csv')
+    
+    # Expected CSV Columns: [Time, Level, Flow, Turbidity, TDS, True_Depth]
+    # Slices 4 physical sensors: Level (1), Flow (2), Turbidity (3), TDS (4)
+    features = df.iloc[:, [1, 2, 3, 4]].values.astype('float32')
+    
+    # Target depth: True_Depth (5)
+    y_train = df.iloc[:, [5]].values.astype('float32')
+    
+    print(f"Success! Data loaded. Rows found: {features.shape[0]}")
+
+except FileNotFoundError:
+    print("CSV not found. Enforcing safe fallback to identical dummy data structure...")
+    features = np.random.normal(20, 5, (100, 4)).astype('float32')
+    y_train = np.random.normal(2, 0.5, (100, 1)).astype('float32')
+
+# --- STEP 2: FIXED PRE-PROCESSING ---
+num_samples = features.shape[0]
+
+# Build time domain tracking sample length
+t_train = np.linspace(0, 10, num_samples).astype('float32').reshape(-1, 1)
+
+# Perform min-max scaling across feature metrics safely (+1e-8 prevents div by zero)
+feat_min = features.min(axis=0)
+feat_max = features.max(axis=0)
+features_norm = (features - feat_min) / (feat_max - feat_min + 1e-8)
+
+# PRE-COMPUTE TENSORS OUTSIDE THE LOOP (Optimizes Training Speed)
+X_input = tf.concat([tf.convert_to_tensor(t_train), tf.convert_to_tensor(features_norm)], axis=1)
+y_train_tensor = tf.convert_to_tensor(y_train)
+t_train_tensor = tf.convert_to_tensor(t_train)
+
+# EXTRACT ACTUAL FLOW DATA: Index 1 of features_norm corresponds to Flow (Col 2 in CSV)
+flow_data_tensor = tf.convert_to_tensor(features_norm[:, 1:2])
+
+
+# --- STEP 3: INITIALIZE PINN ENGINE ---
+model = build_pinn(5) 
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
+
+
+# --- STEP 4: CUSTOM GRADIENT TRAINING LOOP ---
+print("Starting Training...")
+for epoch in range(1000):
+    
+    with tf.GradientTape() as tape:
+        # Evaluate input arrays against neural layers
+        predictions = model(X_input) 
+        
+        # Loss 1: Empirical Data Regression Error
+        data_loss = tf.reduce_mean(tf.square(predictions - y_train_tensor))
+        
+        # Loss 2: Hydrodynamic Physics Optimization (Mass Balance Checking)
+        p_loss = sbr_physics_loss(model, t_train_tensor, features_norm, flow_data_tensor)
+        
+        # Loss 3: Probabilistic Regularization (Bayesian Structural Weights Layer KL Divergence)
+        kl_loss = sum(model.losses) / num_samples
+        
+        # Compound Objective Weighting
+        total_loss = data_loss + (0.5 * p_loss) + kl_loss
+        
+    # Isolate parameter gradients and update weights
+    grads = tape.gradient(total_loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+
+    # Metric Dashboard Print Execution
+    if epoch % 100 == 0:
+        print(f"Epoch {epoch}: Total Loss = {total_loss.numpy():.4f} | Data Loss = {data_loss.numpy():.4f} | Physics Loss = {p_loss.numpy():.4f}")
+
+
+# --- STEP 5: SAVE WEIGHTS ---
+print("\nTraining Complete! Finalizing weights...")
+os.makedirs('models', exist_ok=True)
+model.save_weights('models/flowpure_brain.h5')
+model.save_weights('flowpure_brain.h5')
+print("SUCCESS! Model weights saved as: flowpure_brain.h5")
