@@ -9,7 +9,7 @@ from models.stp_model import build_pinn
 from pyModbusTCP.client import ModbusClient
 
 # ==========================================
-# 1. LOAD BPINN MODEL & BOUNDARIES
+# 1. LOAD PINN MODEL & BOUNDARIES
 # ==========================================
 print("Loading PINN Architecture...")
 model = build_pinn(5)
