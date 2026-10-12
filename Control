@@ -1,0 +1,108 @@
+import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
+import time
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from models.stp_model import build_pinn
+from pyModbusTCP.client import ModbusClient
+
+# ==========================================
+# 1. LOAD BPINN MODEL & BOUNDARIES
+# ==========================================
+print("Loading PINN Architecture...")
+model = build_pinn(5)
+model.build(input_shape=(None, 5))
+
+model_paths = [
+    'models/flowpure_brain.h5', 'flowpure_brain.h5',
+    'models/flowpure_brain_weights.h5', 'flowpure_brain_weights.h5'
+]
+
+loaded = False
+for path in model_paths:
+    if os.path.exists(path):
+        model.load_weights(path)
+        print(f"Trained brain loaded successfully from {path}!")
+        loaded = True
+        break
+
+if not loaded:
+    print("CRITICAL ERROR: Could not find flowpure_brain weights file.")
+    exit()
+
+try:
+    df = pd.read_excel('water_telemetry_test_set.xlsx')
+    train_features = df[['LIT_101', 'FIT_101', 'Turbidity_Raw', 'TDS_Feed']].values.astype('float32')
+    feat_min = train_features.min(axis=0)
+    feat_max = train_features.max(axis=0)
+    print("Scaling boundaries loaded successfully from Excel dataset.")
+except Exception as e:
+    print("Warning: Excel dataset not found. Using physical fallback bounds.")
+    feat_min = np.array([447.0, 0.1, 84.0, 6400.0], dtype='float32')
+    feat_max = np.array([1000.0, 0.9, 213.0, 8100.0], dtype='float32')
+
+# ==========================================
+# 2. MODBUS CONFIG & SUPERVISOR PARAMS
+# ==========================================
+plc = ModbusClient(host="127.0.0.1", port=502, auto_open=True)
+
+MAX_ALLOWED_UNCERTAINTY = 0.15  
+SAFE_FALLBACK_SETPOINT = 180      # Baseline setpoint if AI is uncertain
+
+def predict_pinn_with_uncertainty(time_val, sensor_features, num_mc_samples=10):
+    raw_sensors = np.array(sensor_features, dtype='float32').reshape(1, -1)
+    norm_sensors = (raw_sensors - feat_min) / (feat_max - feat_min + 1e-8)
+    t_input = np.array([[time_val]], dtype='float32')
+    
+    X_single = tf.concat([t_input, norm_sensors], axis=1)
+    X_batched = tf.tile(X_single, [num_mc_samples, 1])
+    
+    preds = model(X_batched, training=True).numpy()
+    
+    predicted_depth = float(np.mean(preds))
+    std_dev = float(np.std(preds))
+    
+    return predicted_depth, std_dev
+
+def run_pinn_supervisor(start_time):
+    if not plc.is_open:
+        print("[-] Connecting to OpenPLC...")
+        plc.open()
+
+    raw_sensors = plc.read_input_registers(0, 4)
+    
+    if not raw_sensors:
+        print("[-] Modbus read failed. Check if OpenPLC simulation is running and bound to port 502.")
+        return
+
+    current_time = time.time() - start_time
+    predicted_h, std_dev = predict_pinn_with_uncertainty(current_time, raw_sensors)
+
+    print(f"\n[SENSORS] Level: {raw_sensors[0]} | Flow: {raw_sensors[1]} | Turbidity: {raw_sensors[2]} | TDS: {raw_sensors[3]}")
+    print(f"[BPINN] Predicted Depth: {predicted_h:.3f}m | Uncertainty (σ): {std_dev:.4f}")
+
+    if std_dev <= MAX_ALLOWED_UNCERTAINTY:
+        target_setpoint = int(predicted_h * 1000) 
+        print(f"[HIGH CONFIDENCE] Writing AI Setpoint ({target_setpoint}) to %MW0...")
+    else:
+        target_setpoint = SAFE_FALLBACK_SETPOINT
+        print(f"[LOW CONFIDENCE] Reverting to Safe Baseline Setpoint ({target_setpoint}) at %MW0...")
+
+    plc.write_single_register(0, target_setpoint)
+
+# ==========================================
+# 3. MAIN EXECUTION LOOP
+# ==========================================
+if __name__ == "__main__":
+    print("\n--- OPENPLC BPINN SUPERVISOR ACTIVE ---")
+    start_time = time.time()
+    
+    try:
+        while True:
+            run_pinn_supervisor(start_time)
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("\n[-] Stopping Supervisor Control Loop.")
+        plc.close()
