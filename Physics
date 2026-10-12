@@ -1,0 +1,31 @@
+import tensorflow as tf
+
+def sbr_physics_loss(model, t_train, features_norm, flow_input):
+    """
+    Calculates the physics-informed loss by watching the model's operations directly.
+    """
+    # We use a GradientTape to compute the derivative of depth with respect to time (dH/dt)
+    with tf.GradientTape() as g:
+        g.watch(t_train)
+        
+        # Re-construct the model input inside the tape so TensorFlow can track it!
+        X_input = tf.concat([t_train, features_norm], axis=1)
+        predictions = model(X_input)
+        
+        # Assume your model outputs a single value (Depth 'h')
+        h = predictions
+
+    # Calculate dH/dt
+    dh_dt = g.gradient(h, t_train)
+    
+    if dh_dt is None:
+        # This safeguard ensures your loop won't crash if tracking fails
+        dh_dt = tf.zeros_like(t_train)
+
+    # Physical Constants (SBR tank surface area in square meters)
+    area = 50.0  
+    
+    # Physics Equation: dh_dt - (Flow / Area) = 0
+    physics_residual = dh_dt - (flow_input / area)
+    
+    return tf.reduce_mean(tf.square(physics_residual))
